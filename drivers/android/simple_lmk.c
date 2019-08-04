@@ -10,6 +10,7 @@
 #include <linux/moduleparam.h>
 #include <linux/oom.h>
 #include <linux/sort.h>
+#include <uapi/linux/sysinfo.h>
 
 /* The minimum number of pages to free per reclaim */
 #define MIN_FREE_PAGES (CONFIG_ANDROID_SIMPLE_LMK_MINFREE * SZ_1M / PAGE_SIZE)
@@ -19,6 +20,8 @@
 
 /* Timeout in jiffies for each reclaim */
 #define RECLAIM_EXPIRES msecs_to_jiffies(CONFIG_ANDROID_SIMPLE_LMK_TIMEOUT_MSEC)
+
+static unsigned int lmk_aggression __read_mostly = CONFIG_ANDROID_SIMPLE_LMK_AGGRESSION;
 
 struct victim_info {
 	struct task_struct *tsk;
@@ -268,7 +271,7 @@ static int simple_lmk_reclaim_thread(void *data)
 
 void simple_lmk_decide_reclaim(int kswapd_priority)
 {
-	if (kswapd_priority == CONFIG_ANDROID_SIMPLE_LMK_AGGRESSION &&
+	if (kswapd_priority == lmk_aggression &&
 	    !atomic_cmpxchg_acquire(&needs_reclaim, 0, 1))
 		wake_up(&oom_waitq);
 }
@@ -294,7 +297,21 @@ void simple_lmk_mm_freed(struct mm_struct *mm)
 static int simple_lmk_init_set(const char *val, const struct kernel_param *kp)
 {
 	static atomic_t init_done = ATOMIC_INIT(0);
+	struct sysinfo i;
 	struct task_struct *thread;
+
+	si_meminfo(&i);
+	pr_info("Totalram=%d",i.totalram);
+	if (i.totalram < 1900000) {
+		lmk_aggression = 1;
+		pr_info("Detected <8GB memory: lmk aggression 1");
+	} else if (i.totalram > 2000000) {
+		lmk_aggression = 3;
+		pr_info("Detected 12GB memory: lmk aggression 3");
+	} else {
+		lmk_aggression = 2;
+		pr_info("Detected 8GB memory: lmk aggression 2");
+	}
 
 	if (!atomic_cmpxchg(&init_done, 0, 1)) {
 		thread = kthread_run(simple_lmk_reclaim_thread, NULL,
