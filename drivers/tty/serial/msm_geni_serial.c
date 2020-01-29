@@ -114,7 +114,7 @@
 #define UART_CORE2X_VOTE	(10000)
 #define UART_CONSOLE_CORE2X_VOTE (960)
 
-#define WAKEBYTE_TIMEOUT_MSEC	(2000)
+#define WAKEBYTE_TIMEOUT_MSEC	(100)
 #define WAIT_XFER_MAX_ITER	(50)
 #define WAIT_XFER_MAX_TIMEOUT_US	(10000)
 #define WAIT_XFER_MIN_TIMEOUT_US	(9000)
@@ -191,6 +191,7 @@ struct msm_geni_serial_port {
 	int edge_count;
 	bool manual_flow;
 	struct msm_geni_serial_ver_info ver_info;
+	struct mutex ioctl_mutex;
 };
 
 static const struct uart_ops msm_geni_serial_pops;
@@ -381,6 +382,11 @@ static int vote_clock_off(struct uart_port *uport)
 	}
 	wait_for_transfers_inflight(uport);
 	port->ioctl_count--;
+	if (port->ioctl_count < 0) {
+		dev_err(uport->dev, "%s: ioctl_count < 0(%d), fixing it to 0\n",
+				__func__, port->ioctl_count);
+		port->ioctl_count = 0;
+	}
 	msm_geni_serial_power_off(uport);
 	usage_count = atomic_read(&uport->dev->power.usage_count);
 	IPC_LOG_MSG(port->ipc_log_pwr, "%s:%s ioctl:%d usage_count:%d\n",
@@ -391,24 +397,28 @@ static int vote_clock_off(struct uart_port *uport)
 static int msm_geni_serial_ioctl(struct uart_port *uport, unsigned int cmd,
 						unsigned long arg)
 {
-	int ret = -ENOIOCTLCMD;
+	struct msm_geni_serial_port *port = GET_DEV_PORT(uport);
+	int ret;
+
+	mutex_lock(&port->ioctl_mutex);
 
 	switch (cmd) {
-	case TIOCPMGET: {
+	case TIOCPMGET:
 		ret = vote_clock_on(uport);
 		break;
-	}
-	case TIOCPMPUT: {
+	case TIOCPMPUT:
 		ret = vote_clock_off(uport);
 		break;
-	}
-	case TIOCPMACT: {
+	case TIOCPMACT:
 		ret = !pm_runtime_status_suspended(uport->dev);
 		break;
-	}
 	default:
+		ret = -ENOIOCTLCMD;
 		break;
 	}
+
+	mutex_unlock(&port->ioctl_mutex);
+
 	return ret;
 }
 
@@ -1613,12 +1623,8 @@ static void msm_geni_serial_shutdown(struct uart_port *uport)
 	unsigned long flags;
 
 	/* Stop the console before stopping the current tx */
-	if (uart_console(uport)) {
+	if (uart_console(uport))
 		console_stop(uport->cons);
-	} else {
-		msm_geni_serial_power_on(uport);
-		wait_for_transfers_inflight(uport);
-	}
 
 	disable_irq(uport->irq);
 	free_irq(uport->irq, uport);
@@ -2335,6 +2341,11 @@ static void msm_geni_serial_cons_pm(struct uart_port *uport,
 		se_geni_resources_off(&msm_port->serial_rsc);
 }
 
+static void msm_geni_flush_buffer(struct uart_port *uport)
+{
+       msm_geni_serial_stop_tx(uport);
+}
+
 static const struct uart_ops msm_geni_console_pops = {
 	.tx_empty = msm_geni_serial_tx_empty,
 	.stop_tx = msm_geni_serial_stop_tx,
@@ -2347,6 +2358,7 @@ static const struct uart_ops msm_geni_console_pops = {
 	.type = msm_geni_serial_get_type,
 	.set_mctrl = msm_geni_cons_set_mctrl,
 	.get_mctrl = msm_geni_cons_get_mctrl,
+	.flush_buffer = msm_geni_flush_buffer,
 #ifdef CONFIG_CONSOLE_POLL
 	.poll_get_char	= msm_geni_serial_get_char,
 	.poll_put_char	= msm_geni_serial_poll_put_char,
@@ -2864,6 +2876,7 @@ static int __init msm_geni_serial_init(void)
 		msm_geni_serial_ports[i].uport.ops = &msm_geni_serial_pops;
 		msm_geni_serial_ports[i].uport.flags = UPF_BOOT_AUTOCONF;
 		msm_geni_serial_ports[i].uport.line = i;
+		mutex_init(&msm_geni_serial_ports[i].ioctl_mutex);
 	}
 
 	for (i = 0; i < GENI_UART_CONS_PORTS; i++) {
@@ -2871,6 +2884,7 @@ static int __init msm_geni_serial_init(void)
 		msm_geni_console_port.uport.ops = &msm_geni_console_pops;
 		msm_geni_console_port.uport.flags = UPF_BOOT_AUTOCONF;
 		msm_geni_console_port.uport.line = i;
+		mutex_init(&msm_geni_console_port.ioctl_mutex);
 	}
 
 
